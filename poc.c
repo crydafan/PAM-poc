@@ -11,6 +11,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __aarch64__
+#include <sys/uio.h>
+#endif
+
 #define DEBUG 1
 
 extern unsigned long module_address(pid_t pid, int prot, const char *name);
@@ -25,6 +29,85 @@ unsigned long ptrace_checked(enum __ptrace_request request, pid_t pid, void *add
 #endif
 	return ret;
 }
+
+/*
+ * Architecture-specific register access abstractions.
+ *
+ * x86-64: uses PTRACE_GETREGS/PTRACE_SETREGS with struct user_regs_struct.
+ * AArch64: uses PTRACE_GETREGSET/PTRACE_SETREGSET (NT_PRSTATUS) with
+ *          struct user_pt_regs, as PTRACE_GETREGS is not available on AArch64.
+ */
+#ifdef __aarch64__
+
+typedef struct user_pt_regs arch_regs_t;
+
+#define ARCH_GETREGS(pid, regs) do { \
+	struct iovec _iov = { .iov_base = &(regs), .iov_len = sizeof(regs) }; \
+	ptrace_checked(PTRACE_GETREGSET, (pid), (void *)NT_PRSTATUS, &_iov); \
+} while (0)
+
+#define ARCH_SETREGS(pid, regs) do { \
+	struct iovec _iov = { .iov_base = &(regs), .iov_len = sizeof(regs) }; \
+	ptrace_checked(PTRACE_SETREGSET, (pid), (void *)NT_PRSTATUS, &_iov); \
+} while (0)
+
+/* AArch64 C calling convention: arguments in x0-x7, return value in x0. */
+#define ARCH_REG_ARG0(r)  (r).regs[0]
+#define ARCH_REG_ARG1(r)  (r).regs[1]
+#define ARCH_REG_ARG2(r)  (r).regs[2]
+#define ARCH_REG_ARG3(r)  (r).regs[3]
+#define ARCH_REG_ARG4(r)  (r).regs[4]
+#define ARCH_REG_ARG5(r)  (r).regs[5]
+#define ARCH_REG_PC(r)    (r).pc
+#define ARCH_REG_SP(r)    (r).sp
+#define ARCH_REG_RET(r)   (r).regs[0]
+
+/*
+ * AArch64 BRK #0 instruction (0xD4200000).
+ * When executed under ptrace it delivers SIGTRAP to the tracee.
+ */
+#define ARCH_BREAKPOINT  0xD4200000UL
+
+/*
+ * On AArch64, the return address is held in the link register x30 (regs[30]).
+ * Setting it to 0x0 causes a SIGSEGV when the callee returns via `RET`.
+ */
+#define ARCH_SET_RETURN_TRAP(child, regs) ((regs).regs[30] = 0x0)
+
+#else /* x86-64 */
+
+typedef struct user_regs_struct arch_regs_t;
+
+#define ARCH_GETREGS(pid, regs) \
+	ptrace_checked(PTRACE_GETREGS, (pid), NULL, &(regs))
+
+#define ARCH_SETREGS(pid, regs) \
+	ptrace_checked(PTRACE_SETREGS, (pid), NULL, &(regs))
+
+/* x86-64 System V AMD64 ABI: arguments in rdi, rsi, rdx, rcx, r8, r9. */
+#define ARCH_REG_ARG0(r)  (r).rdi
+#define ARCH_REG_ARG1(r)  (r).rsi
+#define ARCH_REG_ARG2(r)  (r).rdx
+#define ARCH_REG_ARG3(r)  (r).rcx
+#define ARCH_REG_ARG4(r)  (r).r8
+#define ARCH_REG_ARG5(r)  (r).r9
+#define ARCH_REG_PC(r)    (r).rip
+#define ARCH_REG_SP(r)    (r).rsp
+#define ARCH_REG_RET(r)   (r).rax
+
+/* x86-64 single-byte INT 3 software breakpoint. */
+#define ARCH_BREAKPOINT  0xCCUL
+
+/*
+ * On x86-64, the return address is pushed onto the stack.
+ * Setting it to 0x0 causes a SIGSEGV when the callee executes `ret`.
+ */
+#define ARCH_SET_RETURN_TRAP(child, regs) do { \
+	(regs).rsp -= sizeof(long); \
+	ptrace_checked(PTRACE_POKEDATA, (child), (void *)(regs).rsp, (void *)0x0); \
+} while (0)
+
+#endif /* __aarch64__ */
 
 int main(int argc, char *argv[])
 {
@@ -93,13 +176,14 @@ int main(int argc, char *argv[])
 
 			/* Backup a word of data from target's entry point. */
 			word = ptrace_checked(PTRACE_PEEKTEXT, child, (void *)entry_point, NULL);
-			/* int 0x03 */
-			ptrace_checked(PTRACE_POKETEXT, child, (void *)entry_point, (void *)0xCC);
-			/* Continue, the child will send a SIGSTOP executing entry point instruction due `int 0x03` */
+			/* Install a software breakpoint at the entry point. */
+			ptrace_checked(PTRACE_POKETEXT, child, (void *)entry_point,
+					(void *)ARCH_BREAKPOINT);
+			/* Continue; the child will stop when it executes the breakpoint instruction. */
 			ptrace_checked(PTRACE_CONT, child, NULL, NULL);
 		}
 
-		/* Wait for `int 0x03` */
+		/* Wait for the breakpoint. */
 		wait(&status);
 
 		unsigned long local_libc, remote_libc, allocmem;
@@ -119,54 +203,44 @@ int main(int argc, char *argv[])
 				printf("remote `mmap()` function address is: %p\n", (void *)remote_mmap);
 			}
 
-			struct user_regs_struct regs;
+			arch_regs_t regs;
 
 			/* Get the current value of the general-purpose registers. */
-			ptrace_checked(PTRACE_GETREGS, child, NULL, &regs);
+			ARCH_GETREGS(child, regs);
 
 			/*
-			 * Modify registers to remote call `mmap()`
-			 *
-			 * "To pass parameters to the subroutine, we put up to six of them into registers
-			 * (in order: rdi, rsi, rdx, rcx, r8, r9). If there are more than six parameters to
-			 * the subroutine, then push the rest onto the stack."
-			 * - cited from https://wiki.osdev.org/CPU_Registers_x86-64
+			 * Modify registers to remote call `mmap()`.
+			 * Arguments follow the platform's C calling convention.
 			 */
-			regs.rdi = 0; // addr
-			regs.rsi = 0x1000; // length
-			regs.rdx = PROT_READ | PROT_WRITE | PROT_EXEC; // prot
-			regs.rcx = MAP_ANONYMOUS | MAP_PRIVATE; // flags
-			regs.r8 = 0; // fd
-			regs.r9 = 0; // offset
-			regs.rip = remote_mmap;
+			ARCH_REG_ARG0(regs) = 0;                               // addr
+			ARCH_REG_ARG1(regs) = 0x1000;                         // length
+			ARCH_REG_ARG2(regs) = PROT_READ | PROT_WRITE | PROT_EXEC; // prot
+			ARCH_REG_ARG3(regs) = MAP_ANONYMOUS | MAP_PRIVATE;    // flags
+			ARCH_REG_ARG4(regs) = 0;                              // fd
+			ARCH_REG_ARG5(regs) = 0;                              // offset
+			ARCH_REG_PC(regs) = remote_mmap;
 
 			/*
-			 * Set the return adress to 0x0 so when the subroutine uses `ret` it will raise a signal
-			 * and we can catch it.
-			 *
-			 * "To call the subroutine, use the call instruction. This instruction places the return
-			 * address on top of the parameters on the stack, and branches to the subroutine code."
-			 * - cited from https://wiki.osdev.org/CPU_Registers_x86-64
+			 * Set the return address to 0x0 so that when the subroutine returns it
+			 * will raise a signal that we can catch.
 			 */
-			regs.rsp -= sizeof(long);
-			ptrace_checked(PTRACE_POKEDATA, child, (void *)regs.rsp, 0x0);
+			ARCH_SET_RETURN_TRAP(child, regs);
 
 			/* Send our modified registers. */
-			ptrace_checked(PTRACE_SETREGS, child, NULL, &regs);
+			ARCH_SETREGS(child, regs);
 			/* Let us continue. */
 			ptrace_checked(PTRACE_CONT, child, NULL, NULL);
 
-			/* Wait for that SIGSEGV caused by the 0x0 return address. */
+			/* Wait for the SIGSEGV caused by the 0x0 return address. */
 			wait(&status);
 
 			/* Get the current value of the general-purpose registers. */
-			ptrace_checked(PTRACE_GETREGS, child, NULL, &regs);
+			ARCH_GETREGS(child, regs);
 
 			/*
-			 * "The caller can expect to find the return value of the subroutine in the register RAX."
-			 * - cited from https://wiki.osdev.org/CPU_Registers_x86-64
+			 * The return value of the subroutine is in the first return register.
 			 */
-			allocmem = regs.rax;
+			allocmem = ARCH_REG_RET(regs);
 			printf("remote `mmap()` returned: %p\n", (void *)allocmem);
 
 			/* +1 to consider the \0 character of every C string. */
@@ -205,39 +279,38 @@ int main(int argc, char *argv[])
 				printf("remote `dlopen()` function address is: %p\n", (void *)remote_dlopen);
 			}
 
-			struct user_regs_struct regs;
+			arch_regs_t regs;
 
 			/* Get the current value of the general-purpose registers. */
-			ptrace_checked(PTRACE_GETREGS, child, NULL, &regs);
+			ARCH_GETREGS(child, regs);
 
 			/* Modify registers to remote call `dlopen()` */
-			regs.rdi = allocmem; // filename
+			ARCH_REG_ARG0(regs) = allocmem;                // filename
 			/* 
 			 * We need our library to be loaded completely and globally for subsequent dynamic
 			 * dependencies.
 			 */
-			regs.rsi = RTLD_NOW | RTLD_GLOBAL; // flags
-			regs.rip = remote_dlopen;
+			ARCH_REG_ARG1(regs) = RTLD_NOW | RTLD_GLOBAL; // flags
+			ARCH_REG_PC(regs) = remote_dlopen;
 
 			/*
-			 * Set the return adress to 0x0 so when the subroutine uses `ret` it will raise a signal
-			 * and we can catch it.
+			 * Set the return address to 0x0 so that when the subroutine returns it
+			 * will raise a signal that we can catch.
 			 */
-			regs.rsp -= sizeof(long);
-			ptrace_checked(PTRACE_POKEDATA, child, (void *)regs.rsp, 0x0);
+			ARCH_SET_RETURN_TRAP(child, regs);
 
 			/* Send our modified registers. */
-			ptrace_checked(PTRACE_SETREGS, child, NULL, &regs);
+			ARCH_SETREGS(child, regs);
 			/* Let us continue. */
 			ptrace_checked(PTRACE_CONT, child, NULL, NULL);
 
-			/* Wait for that SIGSEGV caused by the 0x0 return address. */
+			/* Wait for the SIGSEGV caused by the 0x0 return address. */
 			wait(&status);
 
 			/* Get the current value of the general-purpose registers. */
-			ptrace_checked(PTRACE_GETREGS, child, NULL, &regs);
+			ARCH_GETREGS(child, regs);
 
-			unsigned long lib_handle = regs.rax;
+			unsigned long lib_handle = ARCH_REG_RET(regs);
 			printf("remote `dlopen()` returned: %p\n", (void *)lib_handle);
 		}
 
@@ -246,17 +319,17 @@ int main(int argc, char *argv[])
 			ptrace_checked(PTRACE_POKETEXT, child, (void *)entry_point, (void *)word);
 
 			/* Get the current value of the general-purpose registers. */
-			struct user_regs_struct regs;
-			ptrace_checked(PTRACE_GETREGS, child, NULL, &regs);
+			arch_regs_t regs;
+			ARCH_GETREGS(child, regs);
 
 			/*
-			 * Set Instruction Pointer to entry point to execute the target program as if
+			 * Set Program Counter to entry point to execute the target program as if
 			 * nothing happened.
 			 */
-			regs.rip = entry_point;
+			ARCH_REG_PC(regs) = entry_point;
 
 			/* Restore the original state of the target program. */
-			ptrace_checked(PTRACE_SETREGS, child, NULL, &regs);
+			ARCH_SETREGS(child, regs);
 		}
 
 		/* Wait for keyboard input. */
